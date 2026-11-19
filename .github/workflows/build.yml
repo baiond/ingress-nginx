@@ -1,39 +1,20 @@
 name: Build and push ingress-nginx images
 
 on:
-  schedule:
-    - cron: '0 3 * * 2'
   workflow_dispatch:
-    inputs:
-      fork_repo:
-        description: 'Fork repository (owner/repo)'
-        required: false
-        default: 'chainguard-forks/ingress-nginx'
-      docker_org:
-        description: 'Docker Hub organization/username (defaults to the DOCKERHUB_USERNAME secret)'
-        required: false
-        default: 'porterhub'
-      ghcr_org:
-        description: 'Github Container Registry organization/username (defaults to the GHCR_USERNAME secret)'
-        required: false
-        default: 'porter-dev'
 
 env:
   REGISTRY: docker.io
-  GHCR_REGISTRY: ghcr.io
-  DOCKER_ORG: ${{ github.event.inputs.docker_org || secrets.DOCKERHUB_USERNAME }}
-  GHCR_ORG: ${{ github.event.inputs.ghcr_org || secrets.GHCR_USERNAME || github.repository_owner }}
+  DOCKER_ORG: ${{ github.event.inputs.docker_org || vars.DOCKERHUB_USERNAME }}
   FORK_REPO: ${{ github.event.inputs.fork_repo || 'chainguard-forks/ingress-nginx' }}
-  # Platforms to build. 32-bit linux/arm/v7 is intentionally excluded: it is
-  # irrelevant for cloud Kubernetes nodes and its base build breaks under QEMU
-  # emulation (git EFAULT during the ModSecurity clone).
-  BUILD_PLATFORMS: linux/amd64,linux/arm64
-  GO_PLATFORMS: amd64 arm64
+  # Platforms to build: amd64 only.
+  BUILD_PLATFORMS: linux/amd64
+  GO_PLATFORMS: amd64
   # THE knob: the controller minor lines we support. Every run auto-builds the
   # latest upstream controller-v<minor>.<patch> tag for each of these, so new
   # patches AND their (CVE-patched) nginx base images are picked up with zero
   # edits. Add a line here only when you want to start supporting a new minor.
-  SUPPORTED_MINORS: "1.12 1.14 1.15"
+  SUPPORTED_MINORS: "1.15"
 
 jobs:
   prepare:
@@ -42,7 +23,6 @@ jobs:
     outputs:
       controller_matrix: ${{ steps.resolve.outputs.controller_matrix }}
       base_matrix: ${{ steps.resolve.outputs.base_matrix }}
-      base_build_matrix: ${{ steps.resolve.outputs.base_build_matrix }}
       tag_suffix: ${{ steps.suffix.outputs.tag_suffix }}
     steps:
       - name: Checkout
@@ -119,30 +99,22 @@ jobs:
             fi
           done
 
-          # Fan each base out into one native per-arch build (amd64 + arm64).
-          build_items=$(jq -c '[ .[] | . as $b | ("amd64","arm64") | $b + {arch: .} ]' <<<"$base_items")
-
           echo "Resolved controller matrix:"
           jq . <<<"$controller"
-          echo "Resolved base image matrix (merge):"
+          echo "Resolved base image matrix:"
           jq . <<<"$base_items"
-          echo "Resolved per-arch base build matrix:"
-          jq . <<<"$build_items"
           echo "controller_matrix={\"include\":${controller}}" >> "$GITHUB_OUTPUT"
           echo "base_matrix={\"include\":${base_items}}" >> "$GITHUB_OUTPUT"
-          echo "base_build_matrix={\"include\":${build_items}}" >> "$GITHUB_OUTPUT"
 
   build-nginx-base:
-    name: "Build nginx base ${{ matrix.base_tag }} (${{ matrix.arch }})"
-    # Each arch builds on its own native runner, so nothing runs under QEMU.
-    runs-on: ${{ matrix.arch == 'arm64' && 'ubicloud-standard-16-arm' || 'ubicloud-standard-16' }}
+    name: "Build nginx base ${{ matrix.base_tag }} (amd64)"
+    runs-on: ubicloud-standard-16
     needs: prepare
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.prepare.outputs.base_build_matrix) }}
+      matrix: ${{ fromJson(needs.prepare.outputs.base_matrix) }}
     permissions:
       contents: read
-      packages: write
 
     steps:
       - name: Checkout the fork repository
@@ -170,74 +142,23 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
 
-      - name: Build and push ${{ matrix.arch }} nginx base image (native)
+      - name: Build and push amd64 nginx base image
         env:
           REGISTRY: ${{ env.REGISTRY }}/${{ env.DOCKER_ORG }}
           BASE_TAG: ${{ matrix.base_tag }}
           TAG_SUFFIX: ${{ needs.prepare.outputs.tag_suffix }}
-          ARCH: ${{ matrix.arch }}
         run: |
-          echo "Building ${ARCH} nginx base ${BASE_TAG}${TAG_SUFFIX} natively from ${{ env.FORK_REPO }}@${{ matrix.upstream_chart_tag }}"
+          echo "Building amd64 nginx base ${BASE_TAG}${TAG_SUFFIX} natively from ${{ env.FORK_REPO }}@${{ matrix.upstream_chart_tag }}"
           cd images/nginx
-          make push REGISTRY=${REGISTRY} TAG=${BASE_TAG}${TAG_SUFFIX}-${ARCH} PLATFORMS=linux/${ARCH}
-
-  merge-nginx-base:
-    name: "Merge nginx base manifest ${{ matrix.base_tag }}"
-    runs-on: ubicloud-standard-2
-    needs: [prepare, build-nginx-base]
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.prepare.outputs.base_matrix) }}
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_PASSWORD }}
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Assemble multi-arch base manifests
-        env:
-          BASE_TAG: ${{ matrix.base_tag }}
-          TAG_SUFFIX: ${{ needs.prepare.outputs.tag_suffix }}
-          DOCKERHUB_PREFIX: ${{ env.REGISTRY }}/${{ env.DOCKER_ORG }}
-          GHCR_PREFIX: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_ORG }}
-        run: |
-          set -euo pipefail
-          TAG="${BASE_TAG}${TAG_SUFFIX}"
-          AMD64="${DOCKERHUB_PREFIX}/nginx:${TAG}-amd64"
-          ARM64="${DOCKERHUB_PREFIX}/nginx:${TAG}-arm64"
-
-          echo "Combining ${AMD64} + ${ARM64} into multi-arch manifests"
-          # Final base manifest on Docker Hub (consumed by the controller build).
-          docker buildx imagetools create -t "${DOCKERHUB_PREFIX}/nginx:${TAG}" "${AMD64}" "${ARM64}"
-          # Mirror the same manifest to GHCR.
-          docker buildx imagetools create -t "${GHCR_PREFIX}/ingress-nginx-nginx:${TAG}" "${AMD64}" "${ARM64}"
-
-          echo "Docker Hub base manifest:"
-          docker buildx imagetools inspect "${DOCKERHUB_PREFIX}/nginx:${TAG}"
+          make push REGISTRY=${REGISTRY} TAG=${BASE_TAG}${TAG_SUFFIX} PLATFORMS=linux/amd64
 
   build-ingress-nginx:
     name: "Build chainguard/ingress-nginx@${{ matrix.app_version }} | ${{ matrix.chart_version }}"
     runs-on: ubicloud-standard-8
-    needs: [prepare, merge-nginx-base]
+    needs: [prepare, build-nginx-base]
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -246,7 +167,6 @@ jobs:
       matrix: ${{ fromJson(needs.prepare.outputs.controller_matrix) }}
     permissions:
       contents: read
-      packages: write
       
     steps:
       - name: Checkout the fork repository
@@ -260,9 +180,6 @@ jobs:
           sudo mkdir -p /etc/docker
           echo '{"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/daemon.json
           sudo systemctl restart docker
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -277,15 +194,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
-      
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Extract metadata
         id: meta
@@ -335,7 +245,7 @@ jobs:
           set -euo pipefail
           BASE_TAG=$(cat images/nginx/TAG)${TAG_SUFFIX}
           BASE_REF="${REGISTRY}/nginx:${BASE_TAG}"
-          # Pin FROM to the exact digest of the base we just built and merged.
+          # Pin FROM to the exact digest of the base we just built.
           # crane queries the registry directly (bypassing the docker mirror), and
           # a digest pin makes the pull content-addressed: immune to tag mutation
           # or pull-through-cache staleness. This is what guarantees the controller
@@ -349,29 +259,6 @@ jobs:
           make release BASE_IMAGE=${BASE_IMAGE} \
             PLATFORMS="${{ env.GO_PLATFORMS }}" BUILDX_PLATFORMS=${{ env.BUILD_PLATFORMS }}
 
-      - name: Mirror images to GHCR
-        env:
-          TAG: ${{ steps.meta.outputs.version }}${{ needs.prepare.outputs.tag_suffix }}
-          GHCR_PREFIX: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_ORG }}
-        run: |
-          set -euo pipefail
-          for IMAGE in controller controller-chroot; do
-            SRC="docker.io/${{ env.DOCKER_ORG }}/${IMAGE}:${TAG}"
-            DST="${GHCR_PREFIX}/ingress-nginx-${IMAGE}:${TAG}"
-            for attempt in 1 2 3 4 5; do
-              if crane copy "${SRC}" "${DST}"; then
-                break
-              fi
-              if [ "${attempt}" -eq 5 ]; then
-                echo "Mirror to GHCR failed after ${attempt} attempts" >&2
-                exit 1
-              fi
-              sleep_for=$((60 * attempt))
-              echo "Attempt ${attempt} failed (likely Docker Hub 429); retrying in ${sleep_for}s..." >&2
-              sleep "${sleep_for}"
-            done
-          done
-      
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:
@@ -380,21 +267,13 @@ jobs:
       - name: Log in to Docker Hub with Helm
         run: |
           echo "${{ secrets.DOCKERHUB_PASSWORD }}" | helm registry login registry-1.docker.io \
-            --username ${{ secrets.DOCKERHUB_USERNAME }} \
+            --username ${{ vars.DOCKERHUB_USERNAME }} \
             --password-stdin
 
-      - name: Log in to GHCR with Helm
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ${{ env.GHCR_REGISTRY }} \
-            --username ${{ github.actor }} \
-            --password-stdin
-
-      - name: Package and push Helm chart to Docker Hub and GHCR
+      - name: Package and push Helm chart to Docker Hub
         env:
           CHART_VERSION: ${{ matrix.chart_version }}${{ needs.prepare.outputs.tag_suffix }}
           DOCKER_ORG: ${{ env.DOCKER_ORG }}
-          GHCR_ORG: ${{ env.GHCR_ORG }}
-          GHCR_REGISTRY: ${{ env.GHCR_REGISTRY }}
         run: |
           # Navigate to the chart directory
           cd charts/ingress-nginx
@@ -405,11 +284,7 @@ jobs:
           # Push to Docker Hub as OCI artifact
           helm push ingress-nginx-${CHART_VERSION}.tgz oci://registry-1.docker.io/${DOCKER_ORG}
 
-          # Push to GHCR as OCI artifact
-          helm push ingress-nginx-${CHART_VERSION}.tgz oci://${GHCR_REGISTRY}/${GHCR_ORG}
-
           echo "Pushed Helm chart to oci://registry-1.docker.io/${DOCKER_ORG}/ingress-nginx:${CHART_VERSION}"
-          echo "Pushed Helm chart to oci://${GHCR_REGISTRY}/${GHCR_ORG}/ingress-nginx:${CHART_VERSION}"
 
       - name: Generate build summary
         run: |
