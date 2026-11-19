@@ -108,7 +108,7 @@ jobs:
 
   build-nginx-base:
     name: "Build nginx base ${{ matrix.base_tag }} (amd64)"
-    runs-on: ubicloud-standard-16
+    runs-on: self-hosted
     needs: prepare
     strategy:
       fail-fast: false
@@ -157,7 +157,7 @@ jobs:
 
   build-ingress-nginx:
     name: "Build chainguard/ingress-nginx@${{ matrix.app_version }} | ${{ matrix.chart_version }}"
-    runs-on: ubicloud-standard-8
+    runs-on: self-hosted
     needs: [prepare, build-nginx-base]
     strategy:
       fail-fast: false
