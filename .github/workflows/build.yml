@@ -139,6 +139,24 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
       
+      - name: Override Go toolchain with latest patch release
+        # The fork pins GOLANG_VERSION to whatever Go was current when the tag
+        # was cut (e.g. 1.26.2), so the binaries embed a stdlib with known CVEs.
+        # Keep the same minor line (the fork's code is validated against it) but
+        # take the newest patch. The Makefile reads this file for GO_VERSION.
+        run: |
+          set -euo pipefail
+          current=$(tr -d '[:space:]' < GOLANG_VERSION)
+          minor="${current%.*}"   # e.g. 1.26
+          latest=$(curl -fsSL 'https://go.dev/dl/?mode=json' \
+            | jq -r --arg m "go${minor}." '[.[] | select(.stable) | .version | select(startswith($m)) | ltrimstr("go")] | sort_by(split(".") | map(tonumber)) | last')
+          if [ -z "$latest" ] || [ "$latest" = "null" ]; then
+            echo "ERROR: could not resolve latest Go ${minor}.x" >&2
+            exit 1
+          fi
+          echo "Go toolchain: ${current} -> ${latest}"
+          printf '%s\n' "$latest" > GOLANG_VERSION
+
       - name: Install Go
         uses: actions/setup-go@v5
         with:
