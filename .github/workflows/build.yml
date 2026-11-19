@@ -1,12 +1,12 @@
-name: Build and push ingress-nginx images
+name: Build and push ingress-nginx controller image
 
 on:
   workflow_dispatch:
 
 env:
   REGISTRY: docker.io
-  DOCKER_ORG: ${{ github.event.inputs.docker_org || vars.DOCKERHUB_USERNAME }}
-  FORK_REPO: ${{ github.event.inputs.fork_repo || 'chainguard-forks/ingress-nginx' }}
+  DOCKER_ORG: ${{ vars.DOCKERHUB_USERNAME }}
+  FORK_REPO: chainguard-forks/ingress-nginx
   # Platforms to build: amd64 only.
   BUILD_PLATFORMS: linux/amd64
   GO_PLATFORMS: amd64
@@ -18,15 +18,14 @@ env:
 
 jobs:
   prepare:
-    name: "Resolve controller + nginx base matrix"
+    name: "Resolve controller matrix"
     runs-on: self-hosted
     outputs:
       controller_matrix: ${{ steps.resolve.outputs.controller_matrix }}
-      base_matrix: ${{ steps.resolve.outputs.base_matrix }}
       tag_suffix: ${{ steps.suffix.outputs.tag_suffix }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Compute image tag suffix
         id: suffix
@@ -44,7 +43,7 @@ jobs:
             echo "tag_suffix=-${sanitized}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Resolve controller + deduped base image matrix
+      - name: Resolve controller matrix
         id: resolve
         env:
           FORK_REPO: ${{ env.FORK_REPO }}
@@ -58,12 +57,8 @@ jobs:
           all_tags=$(git ls-remote --tags "https://github.com/${FORK_REPO}.git" 'refs/tags/controller-v*' \
             | sed 's#.*refs/tags/##' | grep -v '\^{}' | grep -vE -- '-(alpha|beta|rc)')
 
-          # For each supported minor line, take the newest patch. That tag's
-          # images/nginx/TAG is, by construction, the newest base for the line -
-          # which is why tracking latest-patch keeps the base worry-free.
+          # For each supported minor line, take the newest patch.
           controller='[]'
-          base_items='[]'
-          declare -A seen_base
           for minor in ${SUPPORTED_MINORS}; do
             latest=$(printf '%s\n' "$all_tags" \
               | grep -E "^controller-v${minor}\.[0-9]+$" \
@@ -78,87 +73,21 @@ jobs:
             # controller-v1.15.10 still says appVersion 1.15.6). The tag name is
             # the authoritative, collision-free identifier.
             app_version="${latest#controller-v}"        # e.g. 1.15.10
-            IFS=. read -r _maj min pat <<<"${app_version}"
-            chart_version="4.${min}.${pat}"             # e.g. 4.15.10
 
-            base_tag=$(curl -fsSL "https://raw.githubusercontent.com/${FORK_REPO}/${latest}/images/nginx/TAG" | tr -d '[:space:]')
-            if [ -z "$base_tag" ]; then
-              echo "ERROR: could not read images/nginx/TAG at ${latest}" >&2
-              exit 1
-            fi
-            echo "minor ${minor} -> ${latest} (image v${app_version}, chart ${chart_version}, base ${base_tag})"
+            echo "minor ${minor} -> ${latest} (image v${app_version})"
 
-            controller=$(jq -c --arg av "$app_version" --arg cv "$chart_version" --arg ref "$latest" \
-              '. + [{app_version: $av, chart_version: $cv, upstream_chart_tag: $ref}]' <<<"$controller")
-
-            # Dedupe base builds: distinct minors can share a base tag.
-            if [ -z "${seen_base[$base_tag]:-}" ]; then
-              seen_base[$base_tag]=1
-              base_items=$(jq -c --arg bt "$base_tag" --arg ref "$latest" \
-                '. + [{base_tag: $bt, upstream_chart_tag: $ref}]' <<<"$base_items")
-            fi
+            controller=$(jq -c --arg av "$app_version" --arg ref "$latest" \
+              '. + [{app_version: $av, upstream_chart_tag: $ref}]' <<<"$controller")
           done
 
           echo "Resolved controller matrix:"
           jq . <<<"$controller"
-          echo "Resolved base image matrix:"
-          jq . <<<"$base_items"
           echo "controller_matrix={\"include\":${controller}}" >> "$GITHUB_OUTPUT"
-          echo "base_matrix={\"include\":${base_items}}" >> "$GITHUB_OUTPUT"
-
-  build-nginx-base:
-    name: "Build nginx base ${{ matrix.base_tag }} (amd64)"
-    runs-on: self-hosted
-    needs: prepare
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.prepare.outputs.base_matrix) }}
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout the fork repository
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.FORK_REPO }}
-          ref: ${{ matrix.upstream_chart_tag }}
-
-      - name: Configure Docker registry mirror
-        run: |
-          sudo mkdir -p /etc/docker
-          echo '{"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/daemon.json
-          sudo systemctl restart docker
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: |
-            image=moby/buildkit:buildx-stable-1
-          buildkitd-config-inline: |
-            [registry."docker.io"]
-              mirrors = ["mirror.gcr.io"]
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          registry: docker.io
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_SECRET }}
-
-      - name: Build and push amd64 nginx base image
-        env:
-          REGISTRY: ${{ env.REGISTRY }}/${{ env.DOCKER_ORG }}
-          BASE_TAG: ${{ matrix.base_tag }}
-          TAG_SUFFIX: ${{ needs.prepare.outputs.tag_suffix }}
-        run: |
-          echo "Building amd64 nginx base ${BASE_TAG}${TAG_SUFFIX} natively from ${{ env.FORK_REPO }}@${{ matrix.upstream_chart_tag }}"
-          cd images/nginx
-          make push REGISTRY=${REGISTRY} TAG=${BASE_TAG}${TAG_SUFFIX} PLATFORMS=linux/amd64
 
   build-ingress-nginx:
-    name: "Build chainguard/ingress-nginx@${{ matrix.app_version }} | ${{ matrix.chart_version }}"
+    name: "Build controller v${{ matrix.app_version }}"
     runs-on: self-hosted
-    needs: [prepare, build-nginx-base]
+    needs: prepare
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -170,7 +99,7 @@ jobs:
       
     steps:
       - name: Checkout the fork repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ env.FORK_REPO }}
           ref: ${{ matrix.upstream_chart_tag }}
@@ -182,7 +111,7 @@ jobs:
           sudo systemctl restart docker
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
         with:
           driver-opts: |
             image=moby/buildkit:buildx-stable-1
@@ -191,9 +120,8 @@ jobs:
               mirrors = ["mirror.gcr.io"]
         
       - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
-          registry: docker.io
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_SECRET }}
       
@@ -233,58 +161,33 @@ jobs:
           docker tag "mirror.gcr.io/library/${IMAGE}" "${IMAGE}"
           docker tag "mirror.gcr.io/library/${IMAGE}" "docker.io/library/${IMAGE}"
 
-      - name: Install crane
-        uses: imjasonh/setup-crane@v0.4
-
-      - name: Build and push images to Docker Hub
+      - name: Build and push controller image to Docker Hub
         env:
           TAG: ${{ steps.meta.outputs.version }}${{ needs.prepare.outputs.tag_suffix }}
           REGISTRY: ${{ env.REGISTRY }}/${{ env.DOCKER_ORG }}
-          TAG_SUFFIX: ${{ needs.prepare.outputs.tag_suffix }}
         run: |
           set -euo pipefail
-          BASE_TAG=$(cat images/nginx/TAG)${TAG_SUFFIX}
-          BASE_REF="${REGISTRY}/nginx:${BASE_TAG}"
-          # Pin FROM to the exact digest of the base we just built.
-          # crane queries the registry directly (bypassing the docker mirror), and
-          # a digest pin makes the pull content-addressed: immune to tag mutation
-          # or pull-through-cache staleness. This is what guarantees the controller
-          # layers on the freshly rebuilt base, never a stale cached one.
-          BASE_DIGEST=$(crane digest "${BASE_REF}")
-          BASE_IMAGE="${REGISTRY}/nginx@${BASE_DIGEST}"
           echo "Building from fork: ${{ env.FORK_REPO }}@${{ matrix.upstream_chart_tag }}"
           echo "Pushing to: ${REGISTRY} (tag ${TAG})"
-          echo "Pinned base image: ${BASE_IMAGE} (resolved from ${BASE_REF})"
 
-          make release BASE_IMAGE=${BASE_IMAGE} \
-            PLATFORMS="${{ env.GO_PLATFORMS }}" BUILDX_PLATFORMS=${{ env.BUILD_PLATFORMS }}
+          # `make release` also builds controller-chroot, so run just the
+          # controller parts of it: builder + clean, Go binaries, one image.
+          make builder clean
+          for arch in ${{ env.GO_PLATFORMS }}; do
+            ARCH=${arch} make build
+          done
 
-      - name: Install Helm
-        uses: azure/setup-helm@v4
-        with:
-          version: 'latest'
-      
-      - name: Log in to Docker Hub with Helm
-        run: |
-          echo "${{ secrets.DOCKERHUB_SECRET }}" | helm registry login registry-1.docker.io \
-            --username ${{ vars.DOCKERHUB_USERNAME }} \
-            --password-stdin
-
-      - name: Package and push Helm chart to Docker Hub
-        env:
-          CHART_VERSION: ${{ matrix.chart_version }}${{ needs.prepare.outputs.tag_suffix }}
-          DOCKER_ORG: ${{ env.DOCKER_ORG }}
-        run: |
-          # Navigate to the chart directory
-          cd charts/ingress-nginx
-
-          # Package the chart
-          helm package . --version ${CHART_VERSION}
-
-          # Push to Docker Hub as OCI artifact
-          helm push ingress-nginx-${CHART_VERSION}.tgz oci://registry-1.docker.io/${DOCKER_ORG}
-
-          echo "Pushed Helm chart to oci://registry-1.docker.io/${DOCKER_ORG}/ingress-nginx:${CHART_VERSION}"
+          docker buildx build \
+            --no-cache \
+            --push \
+            --pull \
+            --progress plain \
+            --platform ${{ env.BUILD_PLATFORMS }} \
+            --build-arg BASE_IMAGE="$(cat NGINX_BASE)" \
+            --build-arg VERSION="${TAG}" \
+            --build-arg COMMIT_SHA="git-$(git rev-parse --short HEAD)" \
+            --build-arg BUILD_ID="UNSET" \
+            -t "${REGISTRY}/controller:${TAG}" rootfs
 
       - name: Generate build summary
         run: |
@@ -298,18 +201,6 @@ jobs:
           echo "**Date:** ${{ steps.meta.outputs.date }}" >> $GITHUB_STEP_SUMMARY
           echo "**Docker Org:** \`${{ env.DOCKER_ORG }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Built Images" >> $GITHUB_STEP_SUMMARY
+          echo "### Built Image" >> $GITHUB_STEP_SUMMARY
           echo "- \`${REGISTRY}/controller:${VERSION}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`${REGISTRY}/controller-chroot:${VERSION}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Packaged Charts" >> $GITHUB_STEP_SUMMARY
-          echo "- \`oci://registry-1.docker.io/${DOCKER_ORG}/ingress-nginx:${CHART_VERSION}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Helm Override Example" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
-          echo "helm upgrade --install oci://registry-1.docker.io/porterhub/ingress-nginx:VERSION \\" >> $GITHUB_STEP_SUMMARY
-          echo "  --namespace ingress-nginx --create-namespace \\" >> $GITHUB_STEP_SUMMARY
-          echo "  --set controller.image.registry=docker.io \\" >> $GITHUB_STEP_SUMMARY
-          echo "  --set controller.image.image=${REGISTRY#*/}/controller \\" >> $GITHUB_STEP_SUMMARY
-          echo "  --set controller.image.tag=${VERSION}" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
